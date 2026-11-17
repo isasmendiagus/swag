@@ -830,6 +830,24 @@ Possible directives are comments (beginning with `//`), `replace path/to/a.type 
 
 (Note that the full paths to any named types must be provided to prevent problems when multiple packages define a type with the same name)
 
+A `replace` directive accepts optional `key:value` attributes after the replacement type:
+
+| attribute       | description                                                             |
+|-----------------|-------------------------------------------------------------------------|
+| `nullable:true` | adds `x-nullable: true` to the schema                                   |
+| `optional:true` | removes the field from the `required` list (e.g. `--requiredByDefault`) |
+| `format:<fmt>`  | sets the `format` of the schema                                         |
+
+The `$T` placeholder captures the type argument of a generic type, and can be reused in the replacement type. An exact directive takes precedence over a placeholder one.
+
+```
+// Optional[string] is documented as a nullable string, Optional[model.User] as a nullable model.User, etc.
+replace github.com/foo/bar/common.Optional[$T] $T nullable:true optional:true
+
+// Exact match, takes precedence over the placeholder
+replace github.com/foo/bar/common.Optional[time.Time] string nullable:true optional:true format:date-time
+```
+
 Rendered:
 ```go
 "types.MyStruct": {

@@ -398,11 +398,24 @@ func (parser *Parser) matchOverride(typeName string) *Override {
 		return &o
 	}
 
-	// 2. Placeholder match — find keys containing $T
-	for key, o := range parser.Overrides {
-		if !strings.Contains(key, "$T") {
-			continue
+	// 2. Placeholder match — find keys containing $T.
+	// Keys are tried from the most specific to the least specific one, so the
+	// result does not depend on the map iteration order.
+	var keys []string
+	for key := range parser.Overrides {
+		if strings.Contains(key, "$T") {
+			keys = append(keys, key)
 		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+
+	for _, key := range keys {
+		o := parser.Overrides[key]
 		parts := strings.SplitN(key, "$T", 2)
 		prefix, suffix := parts[0], parts[1]
 		if strings.HasPrefix(typeName, prefix) && strings.HasSuffix(typeName, suffix) {
@@ -427,11 +440,30 @@ func (parser *Parser) getOverrideForType(typeName string, file *ast.File) *Overr
 		return o
 	}
 	if typeSpecDef := parser.packages.FindTypeSpec(typeName, file); typeSpecDef != nil {
-		if o := parser.matchOverride(typeSpecDef.FullPath()); o != nil {
-			return o
-		}
+		return parser.matchOverrideByFullPath(typeSpecDef, typeName)
 	}
 	return nil
+}
+
+// matchOverrideByFullPath resolves an override using the full path of a type.
+// A generic type is also matched by the full path of its declaration followed
+// by its type arguments, e.g. "github.com/foo/bar.Wrapper[string]".
+func (parser *Parser) matchOverrideByFullPath(typeSpecDef *TypeSpecDef, typeName string) *Override {
+	if o := parser.matchOverride(typeSpecDef.FullPath()); o != nil {
+		return o
+	}
+
+	idx := strings.Index(typeName, "[")
+	if idx <= 0 {
+		return nil
+	}
+
+	name := typeName[:idx]
+	if dot := strings.LastIndex(name, "."); dot >= 0 {
+		name = name[dot+1:]
+	}
+
+	return parser.matchOverride(typeSpecDef.PkgPath + "." + name + typeName[idx:])
 }
 
 // SetCollectionFormat set default collection format
@@ -1324,14 +1356,27 @@ func convertFromSpecificToPrimitive(typeName string) (string, error) {
 	return typeName, ErrFailedConvertPrimitiveType
 }
 
-// applyOverrideAttrs applies nullable and format attributes from an override to a schema.
-func applyOverrideAttrs(schema *spec.Schema, override *Override) {
+// applyOverrideAttrs returns the schema with the nullable and format attributes of an override applied.
+// The given schema is never modified, since it may be shared with other fields.
+func applyOverrideAttrs(schema *spec.Schema, override *Override) *spec.Schema {
+	if schema == nil || override == nil || (!override.IsNullable() && override.Format() == "") {
+		return schema
+	}
+
+	newSchema := *schema
+	newSchema.Extensions = make(spec.Extensions, len(schema.Extensions)+1)
+	for k, v := range schema.Extensions {
+		newSchema.Extensions[k] = v
+	}
+
 	if override.IsNullable() {
-		schema.AddExtension("x-nullable", true)
+		newSchema.AddExtension("x-nullable", true)
 	}
 	if f := override.Format(); f != "" {
-		schema.Format = f
+		newSchema.Format = f
 	}
+
+	return &newSchema
 }
 
 func (parser *Parser) getTypeSchema(typeName string, file *ast.File, ref bool) (*spec.Schema, error) {
@@ -1345,8 +1390,7 @@ func (parser *Parser) getTypeSchema(typeName string, file *ast.File, ref bool) (
 		if err != nil {
 			return nil, err
 		}
-		applyOverrideAttrs(schema, override)
-		return schema, nil
+		return applyOverrideAttrs(schema, override), nil
 	}
 
 	if IsInterfaceLike(typeName) {
@@ -1366,7 +1410,8 @@ func (parser *Parser) getTypeSchema(typeName string, file *ast.File, ref bool) (
 		return nil, fmt.Errorf("cannot find type definition: %s", typeName)
 	}
 
-	if override := parser.matchOverride(typeSpecDef.FullPath()); override != nil {
+	override := parser.matchOverrideByFullPath(typeSpecDef, typeName)
+	if override != nil {
 		if override.Type == "" {
 			parser.debug.Printf("Override detected for %s: ignoring", typeSpecDef.FullPath())
 			return nil, ErrSkippedField
@@ -1380,13 +1425,24 @@ func (parser *Parser) getTypeSchema(typeName string, file *ast.File, ref bool) (
 			parts := strings.Split(override.Type, ",")
 			schema, err := BuildCustomSchema(parts)
 			if err != nil {
-				return nil, err
+				// not a swaggertype, e.g. a type captured by a $T placeholder
+				schema, err = parseObjectSchema(parser, override.Type, file)
+				if err != nil {
+					return nil, err
+				}
 			}
-			applyOverrideAttrs(schema, override)
-			return schema, nil
+			return applyOverrideAttrs(schema, override), nil
 		}
 
 		typeSpecDef = parser.packages.findTypeSpec(override.Type[0:separator], override.Type[separator+1:])
+		if typeSpecDef == nil {
+			// not a full path, resolve it the same way as a type used in the file
+			schema, err := parseObjectSchema(parser, override.Type, file)
+			if err != nil {
+				return nil, err
+			}
+			return applyOverrideAttrs(schema, override), nil
+		}
 	}
 
 	parser.packages.CheckTypeSpec(typeSpecDef)
@@ -1398,7 +1454,7 @@ func (parser *Parser) getTypeSchema(typeName string, file *ast.File, ref bool) (
 		schema, err = parser.ParseDefinition(typeSpecDef)
 		if err != nil {
 			if err == ErrRecursiveParseStruct && ref {
-				return parser.getRefTypeSchema(typeSpecDef, schema), nil
+				return applyOverrideAttrs(parser.getRefTypeSchema(typeSpecDef, schema), override), nil
 			}
 			return nil, fmt.Errorf("%s: %w", typeName, err)
 		}
@@ -1406,14 +1462,14 @@ func (parser *Parser) getTypeSchema(typeName string, file *ast.File, ref bool) (
 
 	if ref {
 		if IsComplexSchema(schema.Schema) {
-			return parser.getRefTypeSchema(typeSpecDef, schema), nil
+			return applyOverrideAttrs(parser.getRefTypeSchema(typeSpecDef, schema), override), nil
 		}
 		// if it is a simple schema, just return a copy
 		newSchema := *schema.Schema
-		return &newSchema, nil
+		return applyOverrideAttrs(&newSchema, override), nil
 	}
 
-	return schema.Schema, nil
+	return applyOverrideAttrs(schema.Schema, override), nil
 }
 
 func (parser *Parser) getRefTypeSchema(typeSpecDef *TypeSpecDef, schema *Schema) *spec.Schema {
@@ -1780,10 +1836,19 @@ func (parser *Parser) parseStructField(file *ast.File, field *ast.Field) (map[st
 		return nil, nil, fmt.Errorf("%v: %w", fieldNames, err)
 	}
 
+	var override *Override
+
+	if typeName, err := getFieldType(file, field.Type, nil); err == nil {
+		override = parser.getOverrideForType(typeName, file)
+	}
+
+	overridden := false
+
 	if schema == nil {
 		typeName, err := getFieldType(file, field.Type, nil)
 		if err == nil {
 			// named type
+			overridden = override != nil
 			schema, err = parser.getTypeSchema(typeName, file, true)
 		} else {
 			// unnamed type
@@ -1800,6 +1865,12 @@ func (parser *Parser) parseStructField(file *ast.File, field *ast.Field) (map[st
 		return nil, nil, fmt.Errorf("%v: %w", fieldNames, err)
 	}
 
+	// the format of the field tag takes precedence, but the one from the override
+	// must not be lost when the tag does not define it.
+	if overridden && schema.Format == "" && len(schema.Type) > 0 && schema.Type[0] != ARRAY {
+		schema.Format = override.Format()
+	}
+
 	var tagRequired []string
 
 	required, err := ps.IsRequired()
@@ -1812,10 +1883,8 @@ func (parser *Parser) parseStructField(file *ast.File, field *ast.Field) (map[st
 	}
 
 	// Check if override marks this field as optional
-	if typeName, err := getFieldType(file, field.Type, nil); err == nil {
-		if override := parser.getOverrideForType(typeName, file); override != nil && override.IsOptional() {
-			tagRequired = nil
-		}
+	if override != nil && override.IsOptional() {
+		tagRequired = nil
 	}
 
 	if formName := ps.FormName(); len(formName) > 0 {

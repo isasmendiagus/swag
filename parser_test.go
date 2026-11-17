@@ -4786,3 +4786,137 @@ type LinkedNode struct {
 		assert.NotContains(t, name, "api.LinkedNode")
 	}
 }
+
+func TestOverrides_matchOverrideIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	for i := 0; i < 100; i++ {
+		p := New(SetOverrides(map[string]Override{
+			"pkg.$T":          {Type: "string"},
+			"pkg.Wrapper[$T]": {Type: "$T"},
+		}))
+
+		o := p.matchOverride("pkg.Wrapper[int]")
+		if assert.NotNil(t, o) {
+			assert.Equal(t, "int", o.Type, "the most specific placeholder should win")
+		}
+	}
+}
+
+func TestOverrides_applyOverrideAttrsDoesNotModifySchema(t *testing.T) {
+	t.Parallel()
+
+	original := PrimitiveSchema(STRING)
+	original.AddExtension("x-foo", "bar")
+
+	override := &Override{Attrs: map[string]string{"nullable": "true", "format": "date-time"}}
+
+	schema := applyOverrideAttrs(original, override)
+	assert.Equal(t, true, schema.Extensions["x-nullable"])
+	assert.Equal(t, "bar", schema.Extensions["x-foo"])
+	assert.Equal(t, "date-time", schema.Format)
+
+	_, ok := original.Extensions["x-nullable"]
+	assert.False(t, ok, "the original schema should not be modified")
+	assert.Empty(t, original.Format)
+
+	assert.Same(t, original, applyOverrideAttrs(original, &Override{}))
+}
+
+func TestParseTypeOverridesWithAttrs(t *testing.T) {
+	t.Parallel()
+
+	const (
+		searchDir = "testdata/override_attrs"
+		pkgPath   = "github.com/swaggo/swag/testdata/override_attrs"
+	)
+
+	attrs := map[string]string{"nullable": "true", "optional": "true"}
+
+	parse := func(t *testing.T, overrides map[string]Override) spec.Schema {
+		p := New(SetOverrides(overrides))
+		p.RequiredByDefault = true
+
+		err := p.ParseAPI(searchDir, mainAPIFile, defaultParseDepth)
+		assert.NoError(t, err)
+
+		for name := range p.swagger.Definitions {
+			assert.NotContains(t, name, "Optional", "no definition should be generated for the overridden type")
+		}
+
+		return p.swagger.Definitions["main.Payload"]
+	}
+
+	refOf := func(schema spec.Schema) string {
+		return schema.Ref.String()
+	}
+
+	assertPlaceholder := func(t *testing.T, payload spec.Schema) {
+		assert.Equal(t, []string{"arr", "foo", "mp", "plain"}, payload.Required)
+
+		for _, name := range []string{"str", "i64", "tm", "st", "in", "loc", "sl", "ptr"} {
+			assert.Equal(t, true, payload.Properties[name].Extensions["x-nullable"], name)
+		}
+
+		assert.Equal(t, spec.StringOrArray{STRING}, payload.Properties["str"].Type)
+		assert.Equal(t, spec.StringOrArray{INTEGER}, payload.Properties["i64"].Type)
+		assert.Equal(t, spec.StringOrArray{STRING}, payload.Properties["tm"].Type)
+		assert.Equal(t, spec.StringOrArray{STRING}, payload.Properties["ptr"].Type)
+		assert.Equal(t, spec.StringOrArray{ARRAY}, payload.Properties["sl"].Type)
+		assert.Equal(t, "#/definitions/model.Status", refOf(payload.Properties["st"]))
+		assert.Equal(t, "#/definitions/model.Inner", refOf(payload.Properties["in"]))
+		assert.Equal(t, "#/definitions/main.Local", refOf(payload.Properties["loc"]))
+
+		arr := payload.Properties["arr"]
+		assert.Equal(t, spec.StringOrArray{STRING}, arr.Items.Schema.Type)
+		assert.Equal(t, true, arr.Items.Schema.Extensions["x-nullable"])
+
+		mp := payload.Properties["mp"]
+		assert.Equal(t, spec.StringOrArray{INTEGER}, mp.AdditionalProperties.Schema.Type)
+		assert.Equal(t, true, mp.AdditionalProperties.Schema.Extensions["x-nullable"])
+	}
+
+	t.Run("Placeholder with short name", func(t *testing.T) {
+		t.Parallel()
+
+		assertPlaceholder(t, parse(t, map[string]Override{
+			"common.Optional[$T]": {Type: "$T", Attrs: attrs},
+		}))
+	})
+
+	t.Run("Placeholder with full path", func(t *testing.T) {
+		t.Parallel()
+
+		assertPlaceholder(t, parse(t, map[string]Override{
+			pkgPath + "/common.Optional[$T]": {Type: "$T", Attrs: attrs},
+		}))
+	})
+
+	t.Run("Exact generic type with full path", func(t *testing.T) {
+		t.Parallel()
+
+		payload := parse(t, map[string]Override{
+			pkgPath + "/common.Optional[$T]":        {Type: "$T", Attrs: attrs},
+			pkgPath + "/common.Optional[time.Time]": {Type: "string", Attrs: map[string]string{"format": "date-time"}},
+		})
+
+		tm := payload.Properties["tm"]
+		assert.Equal(t, spec.StringOrArray{STRING}, tm.Type)
+		assert.Equal(t, "date-time", tm.Format)
+		assert.Contains(t, payload.Required, "tm")
+	})
+
+	t.Run("Named type replaced by full path keeps attributes", func(t *testing.T) {
+		t.Parallel()
+
+		payload := parse(t, map[string]Override{
+			"common.Optional[$T]":   {Type: "$T"},
+			pkgPath + "/common.Foo": {Type: pkgPath + "/common.Bar", Attrs: attrs},
+		})
+
+		foo := payload.Properties["foo"]
+		assert.Equal(t, "#/definitions/common.Bar", foo.Ref.String())
+		assert.Equal(t, true, foo.Extensions["x-nullable"])
+		assert.NotContains(t, payload.Required, "foo")
+	})
+}

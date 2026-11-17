@@ -418,6 +418,20 @@ func parseOverrides(r io.Reader) (map[string]swag.Override, error) {
 				if len(kv) != 2 {
 					return nil, fmt.Errorf("malformed attribute '%s' in override: '%s'", attr, line)
 				}
+
+				switch kv[0] {
+				case "optional", "nullable":
+					if kv[1] != "true" && kv[1] != "false" {
+						return nil, fmt.Errorf("attribute '%s' must be true or false in override: '%s'", kv[0], line)
+					}
+				case "format":
+					if kv[1] == "" {
+						return nil, fmt.Errorf("malformed attribute '%s' in override: '%s'", attr, line)
+					}
+				default:
+					return nil, fmt.Errorf("unknown attribute '%s' in override: '%s'", kv[0], line)
+				}
+
 				attrs[kv[0]] = kv[1]
 			}
 

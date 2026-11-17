@@ -757,6 +757,21 @@ func TestGen_parseOverrides(t *testing.T) {
 			ExpectedError: fmt.Errorf("malformed attribute 'badattr' in override: 'replace pkg.Foo string badattr'"),
 		},
 		{
+			Name:          "unknown attr",
+			Data:          `replace pkg.Foo string nulable:true`,
+			ExpectedError: fmt.Errorf("unknown attribute 'nulable' in override: 'replace pkg.Foo string nulable:true'"),
+		},
+		{
+			Name:          "invalid boolean attr",
+			Data:          `replace pkg.Foo string nullable:yes`,
+			ExpectedError: fmt.Errorf("attribute 'nullable' must be true or false in override: 'replace pkg.Foo string nullable:yes'"),
+		},
+		{
+			Name:          "empty format attr",
+			Data:          `replace pkg.Foo string format:`,
+			ExpectedError: fmt.Errorf("malformed attribute 'format:' in override: 'replace pkg.Foo string format:'"),
+		},
+		{
 			Name: "placeholder in key",
 			Data: `replace pkg.Wrapper[$T] $T nullable:true`,
 			Expected: map[string]swag.Override{
